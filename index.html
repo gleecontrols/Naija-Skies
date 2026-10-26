@@ -54,7 +54,7 @@ table{border-collapse:collapse;max-width:620px;text-align:left}td{padding:3px 10
 <p>Regional captain, ATR 72-class turboprop. Real Nigerian airports, real runway headings, Nigerian weather.</p>
 <div class="row"><select id="ac"></select><select id="rt"></select><select id="wx"><option value="0">Clear</option><option value="1" selected>Harmattan haze</option><option value="2">Rainy-season storm</option></select></div>
 <div class="row"><button class="go" id="go">Start flight</button><button id="gm" onclick="showGuide()">Flying guide</button></div>
-<p id="stats"></p>
+<p id="stats"></p><p id="mstat" style="font-size:12px;opacity:.6"></p>
 <ul><li><b>Fly:</b> ↓ pull up, ↑ push down, ←→ bank. W/S throttle. A/D rudder.</li>
 <li><b>Aircraft:</b> Z/X flaps, G gear, Space brakes, C or 1–5 cameras, N swap aircraft while parked, M map, F1 guide.</li>
 <li><b>Cruise:</b> H autopilot (flies to the approach fix). T speeds up time with autopilot on. P pause.</li>
@@ -251,8 +251,70 @@ const rain=new THREE.LineSegments(rg,new THREE.LineBasicMaterial({color:0xb8c6d4
 function fx(dt){const on=WXI==2;rain.visible=on;if(on){const zv=G.cam==0?S.V*.5:2;for(let i=0;i<RN;i++){const d=dr_[i];d[1]-=28*dt;d[2]+=zv*dt;if(d[1]<-20||d[2]>2){d[0]=(Math.random()-.5)*60;d[1]=20;d[2]=-5-Math.random()*55}
  rp.set([d[0],d[1],d[2],d[0],d[1]+.9,d[2]-zv*.04],i*6)}rg.attributes.position.needsUpdate=true;if(flash<=0&&Math.random()<dt*.12)flash=.14;hemi.intensity=.55+(flash>0?2.2:0);flash-=dt}
  if(G.cam==2&&!vo.drag)vo.oa+=dt*.25}
+/* ===== REALISTIC 3D MODELS (GLB) =====
+   Everything here is optional: if a model fails to load, the original low-poly look stays. */
+const MODELS={
+ atc:   {url:'models/atc_tower.glb',      h:58},                 // h = target height in metres
+ wwii:  {url:'models/wwii_tower.glb',     h:22},
+ tunnel:{url:'models/airport_tunnel.glb', len:42,opaque:1,drop:/collid/i}, // len = target longest side
+ truck: {url:'models/truck.glb',          len:5.6},
+ fuel:  {url:'models/fuel_truck.glb',     len:10.5},
+ keke:  {url:'models/rickshaw.glb',       len:2.7}};   // keke = Nigerian auto rickshaw
+/* Plane models: index in AIR[] -> {url, yaw (deg, rotate so the nose points forward), len (optional metres), spin:/regex of propeller nodes/, gear:/regex of landing-gear nodes/}
+   0 Cessna 172 · 1 King Air 350 · 2 ATR 72 · 3 Dash 8 Q400 · 4 Embraer E145 · 5 Boeing 737-800 */
+const PLANE_MODELS={
+ 2:{url:'models/atr72.glb',yaw:180},   // yaw: nose of the model points +Z, game forward is -Z
+ 3:{url:'models/dash8.glb',yaw:180},
+ 5:{url:'models/b737.glb',yaw:90},     // nose points +X
+};
+const GLB={cache:{},ok:0,total:0,loader:null};
+function glbLoaderReady(){if(GLB.loader)return GLB.loader;
+ const src=['lib/GLTFLoader.js','https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js','https://unpkg.com/three@0.128.0/examples/js/loaders/GLTFLoader.js'];
+ return GLB.loader=new Promise(res=>{let i=0;const next=()=>{if(THREE.GLTFLoader)return res(true);if(i>=src.length)return res(false);
+  const s=document.createElement('script');s.src=src[i++];s.onload=()=>THREE.GLTFLoader?res(true):next();s.onerror=next;document.head.appendChild(s)};next()})}
+function tuneGLB(root,o){const kill=[];root.traverse(n=>{if(o.drop&&o.drop.test(n.name))kill.push(n)});kill.forEach(n=>n.parent&&n.parent.remove(n));
+ root.traverse(n=>{if(!n.isMesh)return;(Array.isArray(n.material)?n.material:[n.material]).forEach(m=>{if(m.userData.tuned)return;m.userData.tuned=1;
+  /* game renders in linear output: show textures as authored, convert flat colours to match */
+  for(const k of['map','emissiveMap'])if(m[k]){m[k].encoding=THREE.LinearEncoding;m[k].anisotropy=4}
+  if(m.color)m.color.convertLinearToSRGB();
+  if(m.emissive){if(m.emissiveMap)m.emissiveIntensity=.7;else m.emissive.setRGB(0,0,0)}
+  if(m.metalness!==undefined){m.metalness=Math.min(m.metalness,.3);m.roughness=Math.max(m.roughness,.55)}
+  m.normalScale&&m.normalScale.set(.6,.6);
+  if(o.opaque){m.transparent=false;m.opacity=1;m.depthWrite=true;m.alphaTest=0}
+  m.needsUpdate=true})})}
+function fitGLB(src,o){const root=src.clone(true);tuneGLB(root,o);root.updateMatrixWorld(true);
+ const b=new THREE.Box3().setFromObject(root),sz=b.getSize(new THREE.Vector3()),c=b.getCenter(new THREE.Vector3());
+ root.position.set(-c.x,-b.min.y,-c.z);const g=new THREE.Group();g.add(root);
+ const s=o.h?o.h/sz.y:o.len?o.len/Math.max(sz.x,sz.z):1;g.scale.setScalar(s);g.userData.size=sz.multiplyScalar(s);return g}
+function loadGLB(url){if(GLB.cache[url])return GLB.cache[url];
+ return GLB.cache[url]=glbLoaderReady().then(ok=>{if(!ok)throw new Error('GLTFLoader unavailable');
+  return new Promise((res,rej)=>new THREE.GLTFLoader().load(url,g=>res(g.scene),undefined,rej))})}
+const aptModels=new THREE.Group();world.add(aptModels);
+function placeAirport(k,M){const a=APT[k],h=a.h[0]*D2R,ax=Math.sin(h),az=-Math.cos(h),lx=Math.cos(h),lz=Math.sin(h),big=k!='BNI',rnd=(i)=>hs(a.lat*7+i,a.lon*5+i);
+ const put=(g,al,lat,yaw)=>{const x=a.x+ax*al+lx*lat,z=a.z+az*al+lz*lat;g.position.set(x,H(x,z),z);g.rotation.y=yaw;aptModels.add(g);return g};
+ /* control tower: big airports get the modern tower, Benin the vintage one, set back from the runway on the apron side, facing it */
+ const tw=big?M.atc:M.wwii;if(tw)put(tw.clone(),a.len*.08,big?190:130,Math.atan2(-lx,-lz));
+ /* terminal connectors in a row along the apron */
+ if(M.tunnel){const n=k=='LOS'?4:k=='ABV'?3:2;for(let i=0;i<n;i++)put(M.tunnel.clone(),-a.len*.12+(i-(n-1)/2)*70,115,-h)}
+ /* ground vehicles parked and driving around the apron */
+ if(M.fuel){const n=big?3:1;for(let i=0;i<n;i++)put(M.fuel.clone(),-a.len*.12+(i-(n-1)/2)*95+30,62+rnd(i+80)*10,-h+(rnd(i+90)>.5?0:Math.PI))}
+ if(M.keke){const n=big?8:4;for(let i=0;i<n;i++)put(M.keke.clone(),-a.len*.2+rnd(i+110)*a.len*.3,170+rnd(i+120)*70,rnd(i+130)*6.28)}
+ if(M.truck){const n=big?9:5;for(let i=0;i<n;i++){const al=-a.len*.18+(rnd(i)-.5)*a.len*.3,lat=70+rnd(i+30)*60;put(M.truck.clone(),al,lat,rnd(i+60)*6.28)}}}
+function loadAirportModels(){const st=document.getElementById('mstat'),want=Object.entries(MODELS);GLB.total=want.length;GLB.ok=0;const M={};
+ const upd=()=>{if(st)st.textContent=GLB.ok>=GLB.total?'3D models ready':`Loading 3D models… ${GLB.ok}/${GLB.total}`};upd();
+ return Promise.all(want.map(([key,o])=>loadGLB(o.url).then(sc=>{M[key]=fitGLB(sc,o)}).catch(e=>{console.warn('Model skipped:',o.url,e&&e.message||e)}).then(()=>{GLB.ok++;upd()}))).then(()=>{
+  for(const k in APT)try{placeAirport(k,M)}catch(e){console.warn('Airport props failed',k,e)}
+  if(st&&!Object.keys(M).length)st.textContent='3D models unavailable, using simple graphics'})}
+/* Aircraft: swap the low-poly body for a real model when one is configured and loaded */
+function applyPlaneModel(idx,token){const pm=PLANE_MODELS[idx];if(!pm||!pm.url)return;
+ loadGLB(pm.url).then(sc=>{if(token!==buildAC.tok)return;const sp=AIR[idx],g=fitGLB(sc,{len:pm.len||sp.len,drop:pm.drop}),inner=g.children[0];
+  const w=new THREE.Group();w.rotation.y=(pm.yaw||0)*D2R;w.add(g);
+  const b=new THREE.Box3().setFromObject(w);w.position.set(0,-sp.gh-b.min.y,0);
+  const props=[],gear=[];w.traverse(n=>{if(pm.spin&&pm.spin.test(n.name))props.push(n);if(pm.gear&&pm.gear.test(n.name))gear.push(n)});
+  const old=acM.children.slice();acM.add(w);old.forEach(c=>acM.remove(c));
+  acM.userData={props:props,gear:{set visible(v){gear.forEach(n=>n.visible=v)},get visible(){return true}},model:1}}).catch(e=>console.warn('Plane model skipped:',pm.url,e&&e.message||e))}
 /* ===== AIRCRAFT MODELS ===== */
-function buildAC(){while(acM.children.length)acM.remove(acM.children[0]);const a=SP,L=a.len,F=a.rf,mt=c=>new THREE.MeshLambertMaterial({color:c}),Wm=mt(0xf4f7fb),Gm=mt(a.st),Nm=mt(0x0b1f3f),Bm=mt(0x1b1b1b),Sm=mt(0xb9c2cc),ch=a.SW/a.sp,wy=a.hi?F*.75:-F*.55,wz=a.hi?0:L*.04;
+function buildAC(){buildAC.tok=(buildAC.tok|0)+1;const _tok=buildAC.tok;while(acM.children.length)acM.remove(acM.children[0]);const a=SP,L=a.len,F=a.rf,mt=c=>new THREE.MeshLambertMaterial({color:c}),Wm=mt(0xf4f7fb),Gm=mt(a.st),Nm=mt(0x0b1f3f),Bm=mt(0x1b1b1b),Sm=mt(0xb9c2cc),ch=a.SW/a.sp,wy=a.hi?F*.75:-F*.55,wz=a.hi?0:L*.04;
  const ad=(g,m,x,y,z)=>{const o=new THREE.Mesh(g,m);o.position.set(x,y,z);acM.add(o);return o},CY=(r1,r2,l)=>new THREE.CylinderGeometry(r1,r2,l,12).rotateX(Math.PI/2);
  ad(CY(F,F*.7,L*.9),Wm,0,0,L*.05);ad(new THREE.ConeGeometry(F,L*.12,12).rotateX(-Math.PI/2),a.jet?Nm:Wm,0,0,-L*.46);ad(new THREE.ConeGeometry(F*.7,L*.1,12).rotateX(Math.PI/2),Wm,0,0,L*.55);
  for(const x of[-1,1]){ad(new THREE.BoxGeometry(.06,F*.3,L*.62),Gm,x*F*.99,-F*.2,L*.05);ad(new THREE.BoxGeometry(.05,F*.2,L*.42),Bm,x*F*.99,F*.35,-L*.05);ad(new THREE.BoxGeometry(a.sp*.06,.26,ch),Gm,x*a.sp*.47,wy,wz)}
@@ -263,7 +325,7 @@ function buildAC(){while(acM.children.length)acM.remove(acM.children[0]);const a
  if(!a.jet){if(a.eng==1)prop(0,0,-L*.5,a.pr);else for(const x of[-1,1]){ad(CY(F*.3,F*.25,L*.18),Wm,x*a.sp*.22,wy,wz-ch*.2);prop(x*a.sp*.22,wy,wz-ch*.2-L*.09-.1,a.pr)}}
  else for(const x of[-1,1]){if(a.hi)continue;if(a.tee)ad(CY(F*.36,F*.3,L*.13),Sm,x*(F+.8),F*.35,L*.3);else ad(CY(F*.38,F*.33,L*.09),Sm,x*a.sp*.18,wy-F*.5,wz-ch*.5)}
  const gg=new THREE.Group(),wr=a.gh*.17,hh=Math.max(.3,a.gh-wr*2-F),wh=(x,z)=>{const w=new THREE.Mesh(new THREE.CylinderGeometry(wr,wr,wr*.8,10).rotateZ(Math.PI/2),Bm);w.position.set(x,-a.gh+wr,z);gg.add(w);const t=new THREE.Mesh(new THREE.BoxGeometry(.12,hh,.12),Sm);t.position.set(x,-a.gh+wr*2+hh/2,z);gg.add(t)};
- wh(0,-L*.3);wh(-a.sp*.11,L*.06);wh(a.sp*.11,L*.06);acM.add(gg);acM.userData={props,gear:gg}}
+ wh(0,-L*.3);wh(-a.sp*.11,L*.06);wh(a.sp*.11,L*.06);acM.add(gg);acM.userData={props,gear:gg};applyPlaneModel(acI,_tok)}
 function setCam(i){G.cam=i;vo.yaw=0;vo.pit=.25;vo.d=1;subtitle('View: '+VN[i]);clearTimeout(subT);subT=setTimeout(()=>subtitle(''),1500)}
 {let dg=0,lx=0,ly=0;cvs.addEventListener('pointerdown',e=>{dg=1;vo.drag=1;lx=e.clientX;ly=e.clientY});addEventListener('pointerup',()=>{dg=0;vo.drag=0});addEventListener('pointermove',e=>{if(!dg)return;vo.yaw-=(e.clientX-lx)*.006;vo.pit=clamp(vo.pit+(e.clientY-ly)*.005,-.15,1.3);lx=e.clientX;ly=e.clientY});cvs.addEventListener('wheel',e=>{vo.d=clamp(vo.d*(1+e.deltaY*.001),.4,4)},{passive:true})}
 /* ===== GUIDE ===== */
@@ -334,5 +396,5 @@ function loop(ts){requestAnimationFrame(loop);const dt=Math.min(.05,(ts-last)/10
  if(G.run){if(!G.paused){poll(dt);G.tc=tcAllowed();acc+=dt*G.tc;let n=0;while(acc>=1/60&&n<30&&G.run){step(1/60);acc-=1/60;n++}atc();
   if(S.onG&&S.td&&S.V<4&&!S.fin)finish()}hud();audUpd();fx(dt);render()}else if(S.x!==undefined)render()}
 S={x:0,z:0,y:3000,V:100,g:0,psi:0,th:0,ph:0,thr:0,thrE:0,fl:0,gear:1,onG:0,fuel:1,t:0};A={f:APT.LOS,d:APT.ABV,al:APT.BNI,R0:rwy(APT.LOS,60),Rd:rwy(APT.ABV,60),Ra:rwy(APT.BNI,60),flags:{},dist:1,faf:{x:0,z:0},dst:rwy(APT.ABV,60),cruise:6000};
-S.x=APT.LOS.x;S.z=APT.LOS.z;buildAC();setWeather();updGround();requestAnimationFrame(loop);
+S.x=APT.LOS.x;S.z=APT.LOS.z;buildAC();setWeather();updGround();requestAnimationFrame(loop);loadAirportModels();const pre=i=>{const p=PLANE_MODELS[i];if(p&&p.url)loadGLB(p.url).catch(()=>{})};pre(2);$('ac').addEventListener('change',e=>pre(+e.target.value));
 </script></body></html>
